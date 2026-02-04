@@ -1,5 +1,7 @@
 import time
-from typing import Dict, Any
+import asyncio
+from typing import Dict, Any, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from tools.github_tool import GitHubTool
 from tools.weather_tool import WeatherTool
 from tools.news_tool import NewsTool
@@ -7,7 +9,12 @@ from tools.news_tool import NewsTool
 class ExecutorAgent:
     """
     Executor Agent: Executes the plan by calling appropriate tools.
-    Handles retries and error recovery.
+    Features:
+    - Parallel execution of independent steps
+    - Retry logic with exponential backoff
+    - Graceful fallback for partial data
+    - API response caching
+    - Cost tracking per request
     """
     
     def __init__(self):
@@ -16,45 +23,146 @@ class ExecutorAgent:
         self.news_tool = NewsTool()
         self.max_retries = 3
         self.retry_delay = 1
+        
+        # API Response Cache
+        self.cache = {}
+        
+        # Cost tracking (example costs per API call)
+        self.api_costs = {
+            "github": 0.01,
+            "weather": 0.005,
+            "news": 0.008
+        }
+        self.request_cost = 0
     
     def execute_plan(self, plan: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute all steps in the plan"""
+        """Execute all steps in the plan with parallel execution and graceful fallback"""
         results = []
         steps = plan.get("steps", [])
+        self.request_cost = 0  # Reset cost for this request
         
-        for step in steps:
-            step_result = self._execute_step_with_retry(step)
-            results.append({
-                "step_number": step.get("step_number"),
-                "action": step.get("action"),
-                "result": step_result
-            })
+        # Group steps by dependencies for parallel execution
+        step_groups = self._group_steps_for_parallel_execution(steps)
+        
+        for group in step_groups:
+            # Execute steps in parallel within each group
+            group_results = self._execute_steps_in_parallel(group)
+            results.extend(group_results)
+        
+        # Calculate success rate
+        successful_steps = sum(1 for r in results if r.get("result", {}).get("success"))
+        total_steps = len(results)
+        
+        return {
+            "success": True,
+            "results": results,
+            "summary": {
+                "total_steps": total_steps,
+                "successful_steps": successful_steps,
+                "failed_steps": total_steps - successful_steps,
+                "total_cost": round(self.request_cost, 3)
+            }
+        }
+    
+    def _group_steps_for_parallel_execution(self, steps: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+        """
+        Group steps that can be executed in parallel.
+        For simplicity, all steps at the same level can run in parallel.
+        In a more complex system, you'd check for data dependencies.
+        """
+        # Simple implementation: execute all steps in parallel
+        # In production, you'd analyze dependencies between steps
+        return [steps]
+    
+    def _execute_steps_in_parallel(self, steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Execute multiple steps in parallel using ThreadPoolExecutor"""
+        results = []
+        
+        with ThreadPoolExecutor(max_workers=min(len(steps), 5)) as executor:
+            # Submit all steps for execution
+            future_to_step = {
+                executor.submit(self._execute_step_with_retry, step): step
+                for step in steps
+            }
             
-            # Stop execution if a critical step fails
-            if not step_result.get("success"):
-                break
+            # Collect results as they complete
+            for future in as_completed(future_to_step):
+                step = future_to_step[future]
+                try:
+                    step_result = future.result()
+                    results.append({
+                        "step_number": step.get("step_number"),
+                        "action": step.get("action"),
+                        "result": step_result
+                    })
+                except Exception as e:
+                    # Graceful fallback: continue execution even if a step fails
+                    results.append({
+                        "step_number": step.get("step_number"),
+                        "action": step.get("action"),
+                        "result": {
+                            "success": False,
+                            "error": f"Exception during execution: {str(e)}"
+                        }
+                    })
         
-        return {"success": True, "results": results}
+        # Sort results by step number
+        results.sort(key=lambda x: x.get("step_number", 0))
+        return results
     
     def _execute_step_with_retry(self, step: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute a single step with retry logic"""
+        """Execute a single step with retry logic and exponential backoff"""
         for attempt in range(self.max_retries):
             try:
+                # Check cache first
+                cache_key = self._get_cache_key(step)
+                if cache_key in self.cache:
+                    cached_result = self.cache[cache_key]
+                    cached_result["cached"] = True
+                    return cached_result
+                
+                # Execute the step
                 result = self._execute_step(step)
                 
                 if result.get("success"):
+                    # Cache successful results
+                    self.cache[cache_key] = result
+                    
+                    # Track cost
+                    tool = step.get("tool")
+                    self.request_cost += self.api_costs.get(tool, 0)
+                    
                     return result
                 
-                # Retry on failure
+                # Retry on failure with exponential backoff
                 if attempt < self.max_retries - 1:
-                    time.sleep(self.retry_delay)
+                    wait_time = self.retry_delay * (2 ** attempt)  # Exponential backoff
+                    time.sleep(wait_time)
                     
             except Exception as e:
                 if attempt == self.max_retries - 1:
-                    return {"success": False, "error": str(e)}
-                time.sleep(self.retry_delay)
+                    # Graceful fallback: return error but don't stop execution
+                    return {
+                        "success": False,
+                        "error": str(e),
+                        "graceful_fallback": True
+                    }
+                # Exponential backoff
+                wait_time = self.retry_delay * (2 ** attempt)
+                time.sleep(wait_time)
         
-        return {"success": False, "error": "Max retries exceeded"}
+        return {
+            "success": False,
+            "error": "Max retries exceeded",
+            "graceful_fallback": True
+        }
+    
+    def _get_cache_key(self, step: Dict[str, Any]) -> str:
+        """Generate a unique cache key for a step"""
+        tool = step.get("tool", "")
+        action = step.get("action", "")
+        params = str(sorted(step.get("parameters", {}).items()))
+        return f"{tool}:{action}:{params}"
     
     def _execute_step(self, step: Dict[str, Any]) -> Dict[str, Any]:
         """Execute a single step"""
@@ -110,3 +218,14 @@ class ExecutorAgent:
             category = params.get("category")
             max_results = params.get("max_results", 5)
             return self.news_tool.get_top_headlines(country, category, max_results)
+    
+    def clear_cache(self):
+        """Clear the response cache"""
+        self.cache = {}
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get cache statistics"""
+        return {
+            "cached_entries": len(self.cache),
+            "cache_keys": list(self.cache.keys())
+        }
