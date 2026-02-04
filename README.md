@@ -31,7 +31,8 @@ The project uses three different APIs:
 Everything's powered by OpenAI's GPT-3.5 for the thinking parts.
 
 ## Getting Started
-
+## Deployed Link- You can directly check the working of AI Operations Assistant here 
+ 
 ### What You'll Need
 
 - Python 3.8 or newer
