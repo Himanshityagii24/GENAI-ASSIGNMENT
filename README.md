@@ -78,7 +78,7 @@ python main.py
 Head over to `http://localhost:8000/docs` and you'll see an interactive playground where you can test everything.
 
 ## Try It Out
-
+/process api
 Here are some things you can ask it to do:
 
 **GitHub Stuff:**
